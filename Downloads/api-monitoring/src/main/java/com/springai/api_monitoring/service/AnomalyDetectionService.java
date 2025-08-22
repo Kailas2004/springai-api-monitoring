@@ -1,5 +1,7 @@
 package com.springai.api_monitoring.service;
 
+import com.springai.api_monitoring.config.AnomalyDetectionProperties;
+import com.springai.api_monitoring.model.Severity;
 import com.springai.api_monitoring.model.Anomalies;
 import com.springai.api_monitoring.model.Metrics;
 import com.springai.api_monitoring.repository.AnomaliesRepository;
@@ -10,7 +12,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 @Service
 public class AnomalyDetectionService {
@@ -18,58 +22,71 @@ public class AnomalyDetectionService {
     private final MetricsRepository metricsRepository;
     private final AnomaliesRepository anomaliesRepository;
     private final NotificationService notificationService;
+    private final AnomalyDetectionProperties properties;
     private static final Logger logger = LoggerFactory.getLogger(AnomalyDetectionService.class);
 
     public AnomalyDetectionService(
             MetricsRepository metricsRepository,
             AnomaliesRepository anomaliesRepository,
-            NotificationService notificationService) {
+            NotificationService notificationService,
+            AnomalyDetectionProperties properties) {
         this.metricsRepository = metricsRepository;
         this.anomaliesRepository = anomaliesRepository;
         this.notificationService = notificationService;
+        this.properties = properties;
     }
 
     // Main detection logic, manual or scheduled
     public int detectAnomalies() {
         List<Metrics> metricsList = metricsRepository.findAll();
-        int count = 0;
+        int newAnomaliesCount = 0;
         for (Metrics metric : metricsList) {
-            boolean isAnomaly = false;
-            StringBuilder type = new StringBuilder();
-            String severity = "";
+            // Refactored to a helper method for clarity
+            detectAndRecordAnomalyForMetric(metric).ifPresent(anomaly -> newAnomaliesCount++);
+        }
+        return newAnomaliesCount;
+    }
 
-            if (metric.getErrorRate() != null && metric.getErrorRate() > 0.1) {
-                isAnomaly = true;
-                type.append("High Error Rate");
-                severity = "CRITICAL";
-            }
-            if (metric.getResponseTime() != null && metric.getResponseTime() > 800.0) {
-                if (isAnomaly) type.append("; ");
-                isAnomaly = true;
-                type.append("Slow Response Time");
-                if (!"CRITICAL".equals(severity)) {
-                    severity = "WARNING";  // choose higher if any metric is critical
-                }
-            }
-            if (isAnomaly) {
-                String typeString = type.toString().trim();
-                // Deduplication: only insert if not already present
-                boolean exists = anomaliesRepository.findByMetricIdAndType(metric.getId(), typeString).isPresent();
-                if (!exists) {
-                    Anomalies anomaly = Anomalies.builder()
-                            .api(metric.getApi())
-                            .metric(metric)
-                            .type(typeString)
-                            .severity(severity)
-                            .detectedAt(LocalDateTime.now())
-                            .build();
-                    anomaliesRepository.save(anomaly);
-                    notificationService.notifyAnomaly(anomaly); // <-- integrated notification
-                    count++;
-                }
+    private Optional<Anomalies> detectAndRecordAnomalyForMetric(Metrics metric) {
+        List<String> anomalyTypes = new ArrayList<>();
+        Severity severity = null;
+
+        if (metric.getErrorRate() != null && metric.getErrorRate() > properties.getThresholds().getErrorRate()) {
+            anomalyTypes.add("High Error Rate");
+            severity = Severity.CRITICAL;
+        }
+
+        if (metric.getResponseTime() != null && metric.getResponseTime() > properties.getThresholds().getResponseTime()) {
+            anomalyTypes.add("Slow Response Time");
+            // Set severity to WARNING only if a more critical one hasn't been set
+            if (severity == null) {
+                severity = Severity.WARNING;
             }
         }
-        return count;
+
+        if (anomalyTypes.isEmpty()) {
+            return Optional.empty();
+        }
+
+        String typeString = String.join("; ", anomalyTypes);
+
+        // Deduplication: only insert if not already present for this metric and type
+        if (anomaliesRepository.findByMetricIdAndType(metric.getId(), typeString).isPresent()) {
+            return Optional.empty();
+        }
+
+        Anomalies anomaly = Anomalies.builder()
+                .api(metric.getApi())
+                .metric(metric)
+                .type(typeString)
+                .severity(severity.name())
+                .detectedAt(LocalDateTime.now())
+                .build();
+
+        anomaliesRepository.save(anomaly);
+        notificationService.notifyAnomaly(anomaly);
+
+        return Optional.of(anomaly);
     }
 
     // Automatically run detection every 5 minutes
@@ -77,7 +94,8 @@ public class AnomalyDetectionService {
     public void scheduledDetection() {
         int count = detectAnomalies();
         if (count > 0) {
-            logger.info(count + " anomalies detected automatically at " + LocalDateTime.now());
+            // Use parameterized logging for better performance and readability
+            logger.info("{} new anomalies detected automatically at {}", count, LocalDateTime.now());
         }
     }
 }
